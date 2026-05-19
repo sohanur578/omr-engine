@@ -1,6 +1,7 @@
 Flask==3.0.0
 opencv-python-headless==4.8.1.78
 numpy==1.26.2
+scipy
 imutils==0.5.4
 gunicorn==21.2.0
 Werkzeug==3.0.1
