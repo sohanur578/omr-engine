@@ -1,199 +1,251 @@
 import cv2
 import numpy as np
-import imutils
-from imutils.perspective import four_point_transform
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 ANSWER_CHOICES = {0: "A", 1: "B", 2: "C", 3: "D"}
 
-# ======================================================
-# OMR Settings & ROIs 
-# ======================================================
-SCANNED_WIDTH = 800
-SCANNED_HEIGHT = 1100
+# ══════════════════════════════════════════════════════════════════
+#  CALIBRATION  (actual image analysis থেকে নেওয়া — পরিবর্তন করবেন না)
+#
+#  OMR image এর ৪ কোণার কালো মার্কার (7mm square):
+#    TL marker center ≈ (8+3.5, 8+3.5)     = 11.5mm from page edge
+#    TR marker center ≈ (195+3.5, 11.5mm)
+#    BL marker center ≈ (11.5mm, 282+3.5)
+#    BR marker center ≈ (198.5mm, 285.5mm)
+#
+#  Marker center-to-center span:
+#    X: 187mm   Y: 274mm
+#
+#  PHP layout (mm):
+#    colX         = [18, 61.5, 105, 148.5]
+#    bubble X     = colX + qNumW(7.5) + 1.5 + idx*8.0 + 2.5
+#    qStartY      = startY(25) + headerH(6) + 2 = 33mm
+#    bubble Y     = 33 + (row)*9.5 + 4.75   (row 0-indexed)
+#    bubble radius = 2.8mm
+#
+#  Warped canvas: 1133 x 1661 px  (marker center to center)
+#  px/mm = 6.0588
+#  Origin offset: 11.5mm (TL marker center from page edge)
+# ══════════════════════════════════════════════════════════════════
 
-ROI_ROLL = (130, 210, 240, 440)  
+WARP_W    = 1133
+WARP_H    = 1661
+PX_MM     = 6.0588
+ORIG_MM   = 11.5   # TL marker center থেকে coordinate শুরু
 
-ROI_Q_COL1 = (130, 520, 240, 1030) 
-ROI_Q_COL2 = (335, 210, 450, 1030) 
-ROI_Q_COL3 = (545, 210, 660, 1030) 
-ROI_Q_COL4 = (735, 210, 850, 370)  
-# ======================================================
+# বাবলের radius (px)
+BUBBLE_R  = int(2.8 * PX_MM)   # ≈ 16px
 
-def get_real_answers(thresh_img, roi, start_q, num_questions):
-    """Smart Pixel Scanner (Border Ignore Logic)"""
-    x1, y1, x2, y2 = roi
-    h_img, w_img = thresh_img.shape
-    x1, x2 = max(0, x1), min(w_img, x2)
-    y1, y2 = max(0, y1), min(h_img, y2)
-    
-    block = thresh_img[y1:y2, x1:x2]
-    results = {}
-    
-    if block.shape[0] == 0 or block.shape[1] == 0:
-        return results
+# কলামের X positions (bubble center, px) — A,B,C,D
+COL_BUBBLE_X = []
+for cx in [18, 61.5, 105, 148.5]:
+    row_xs = []
+    for idx in range(4):
+        bx_mm = cx + 7.5 + 1.5 + idx * 8.0 + 2.5
+        row_xs.append(int((bx_mm - ORIG_MM) * PX_MM))
+    COL_BUBBLE_X.append(row_xs)
 
-    row_height = block.shape[0] / float(num_questions)
-    col_width = block.shape[1] / 4.0
+# Row Y centers (px) — row 0-indexed, 25 rows per column
+ROW_Y = []
+for row in range(25):
+    cy_mm = 33.0 + row * 9.5 + 4.75
+    ROW_Y.append(int((cy_mm - ORIG_MM) * PX_MM))
 
-    for i in range(num_questions):
-        q_num = start_q + i
-        row_y1 = int(i * row_height)
-        row_y2 = int((i + 1) * row_height)
-        
-        row_pixels = block[row_y1:row_y2, :]
-        
-        bubbled_pixels = []
-        for j in range(4): # A, B, C, D
-            col_x1 = int(j * col_width)
-            col_x2 = int((j + 1) * col_width)
-            
-            bubble_area = row_pixels[:, col_x1:col_x2]
-            
-            # 👉 SMART CROP: চারপাশ থেকে ২৫% কেটে ফেলা, যাতে বৃত্তের কালো বর্ডার বাদ যায়
-            bh, bw = bubble_area.shape
-            if bh > 4 and bw > 4:
-                pad_h, pad_w = int(bh * 0.25), int(bw * 0.25)
-                inner_bubble = bubble_area[pad_h:bh-pad_h, pad_w:bw-pad_w]
+# ══════════════════════════════════════════════════════════════════
+#  THRESHOLD টিউনিং
+#  Blank sheet এ বাবলের inner score ≈ 60-90 (শুধু অক্ষরের কালি)
+#  ভরা বাবলে ≈ 150-250 (পুরো ভেতর কালো)
+#  FILL_THRESHOLD: এর চেয়ে বেশি হলেই ভরা ধরা হবে
+#  DIFF_THRESHOLD: সর্বোচ্চ ও সর্বনিম্নের পার্থক্য এর চেয়ে বেশি হলে উত্তর আছে
+# ══════════════════════════════════════════════════════════════════
+FILL_THRESHOLD = 130   # blank ≈ 65-90, filled ≈ 150+
+DIFF_THRESHOLD = 50    # blank diff ≈ 10-25, filled diff ≈ 80+
+INNER_PAD_RATIO = 0.25 # বাবলের ভেতরের কতটুকু দেখব (চারপাশের অক্ষর/border বাদ)
+
+
+def find_markers(gray):
+    """৪টি কালো স্কয়ার মার্কার খুঁজে তাদের center return করা।"""
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh  = cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 15, 4
+    )
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    markers = []
+    for c in cnts:
+        peri   = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+        area   = cv2.contourArea(c)
+        if len(approx) == 4 and 150 < area < 10000:
+            x, y, w, h = cv2.boundingRect(c)
+            aspect = w / float(h)
+            if 0.7 < aspect < 1.3:  # square-ish
+                cx_m = x + w // 2
+                cy_m = y + h // 2
+                markers.append((cx_m, cy_m, area))
+
+    if len(markers) < 4:
+        return None, f"মাত্র {len(markers)}টি মার্কার পাওয়া গেছে, দরকার ৪টি"
+
+    # সবচেয়ে বড় ৪টি নেওয়া (noise বাদ)
+    markers.sort(key=lambda m: m[2], reverse=True)
+    centers = np.array([(m[0], m[1]) for m in markers[:4]], dtype="float32")
+
+    # TL, TR, BR, BL সাজানো
+    s    = centers.sum(axis=1)
+    diff = np.diff(centers, axis=1)
+    tl   = centers[np.argmin(s)]
+    br   = centers[np.argmax(s)]
+    tr   = centers[np.argmin(diff)]
+    bl   = centers[np.argmax(diff)]
+
+    return np.array([tl, tr, br, bl], dtype="float32"), None
+
+
+def warp_image(gray, marker_pts):
+    """Perspective warp করে নির্দিষ্ট আকারে resize।"""
+    dst = np.array([
+        [0,      0],
+        [WARP_W, 0],
+        [WARP_W, WARP_H],
+        [0,      WARP_H],
+    ], dtype="float32")
+    M = cv2.getPerspectiveTransform(marker_pts, dst)
+    return cv2.warpPerspective(gray, M, (WARP_W, WARP_H))
+
+
+def bubble_score(thresh_img, cy, cx):
+    """একটি বাবলের ভরাট স্কোর বের করা (inner crop)।"""
+    pad  = int(BUBBLE_R * INNER_PAD_RATIO)
+    y1   = max(0, cy - BUBBLE_R + pad)
+    y2   = min(thresh_img.shape[0], cy + BUBBLE_R - pad)
+    x1   = max(0, cx - BUBBLE_R + pad)
+    x2   = min(thresh_img.shape[1], cx + BUBBLE_R - pad)
+    cell = thresh_img[y1:y2, x1:x2]
+    return cv2.countNonZero(cell) if cell.size > 0 else 0
+
+
+def scan_answers(warped_gray):
+    """Warped grayscale থেকে ১০০টি উত্তর বের করা।"""
+    _, thresh = cv2.threshold(
+        warped_gray, 0, 255,
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+
+    answers = {}
+    q_num   = 1
+
+    for col_idx in range(4):
+        xs = COL_BUBBLE_X[col_idx]  # [A_px, B_px, C_px, D_px]
+
+        for row_idx in range(25):
+            cy     = ROW_Y[row_idx]
+            scores = [bubble_score(thresh, cy, xs[opt]) for opt in range(4)]
+
+            max_s  = max(scores)
+            min_s  = min(scores)
+            diff   = max_s - min_s
+
+            if max_s < FILL_THRESHOLD or diff < DIFF_THRESHOLD:
+                answers[str(q_num)] = "skipped"
             else:
-                inner_bubble = bubble_area
-                
-            total_pixels = cv2.countNonZero(inner_bubble)
-            bubbled_pixels.append(total_pixels)
-        
-        max_pixels = max(bubbled_pixels)
-        min_pixels = min(bubbled_pixels)
-        
-        # 👉 SMART LOGIC: পার্থক্য কম হলে বা পিক্সেল কম হলে মানে কাগজ খালি
-        if max_pixels < 40 or (max_pixels - min_pixels) < 30: 
-            results[str(q_num)] = "skipped"
-        else:
-            filled_index = bubbled_pixels.index(max_pixels)
-            results[str(q_num)] = ANSWER_CHOICES[filled_index]
-            
-    return results
+                answers[str(q_num)] = ANSWER_CHOICES[scores.index(max_s)]
 
-def process_final_omr(image_bytes):
+            q_num += 1
+
+    return answers
+
+
+def process_omr(image_bytes):
+    """মূল pipeline।"""
     nparr = np.frombuffer(image_bytes, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
     if image is None:
-        return {"success": False, "error": "ছবিটি পড়া যায়নি!"}
-        
+        return {"success": False, "error": "Invalid image — decode failed"}
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh_pre = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
 
-    cnts = cv2.findContours(thresh_pre.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = imutils.grab_contours(cnts)
-    
-    square_blocks = []
-    if len(cnts) > 0:
-        for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-            area = cv2.contourArea(c)
-            if len(approx) == 4 and 50 < area < 2000:
-                square_blocks.append(c)
-
-    if len(square_blocks) >= 4:
-        centers = []
-        for s in square_blocks:
-            M = cv2.moments(s)
-            if M["m00"] != 0:
-                cX = int(M["m10"] / M["m00"])
-                cY = int(M["m01"] / M["m00"])
-                centers.append((cX, cY))
-        
-        centers = np.array(centers)
-        s = centers.sum(axis=1)
-        diff = np.diff(centers, axis=1)
-        
-        tl = centers[np.argmin(s)]       
-        br = centers[np.argmax(s)]       
-        tr = centers[np.argmin(diff)]    
-        bl = centers[np.argmax(diff)]    
-        
-        pts = np.array([tl, tr, br, bl], dtype="float32")
-        warped_gray = four_point_transform(gray, pts)
+    # Step 1: মার্কার খোঁজা
+    marker_pts, err = find_markers(gray)
+    if marker_pts is None:
+        # Fallback: ছবি সোজা হলে সরাসরি resize করে চেষ্টা
+        warped = cv2.resize(gray, (WARP_W, WARP_H))
+        warn   = err + " — সরাসরি resize দিয়ে চেষ্টা করা হচ্ছে"
     else:
-        return {"success": False, "error": "OMR-এর চারপাশে থাকা কালো মার্কার বক্সগুলো স্পষ্ট নয়। ঠিকমতো ছবি তুলুন।"}
+        warped = warp_image(gray, marker_pts)
+        warn   = None
 
-    warped_gray = cv2.resize(warped_gray, (SCANNED_WIDTH, SCANNED_HEIGHT))
-    thresh_final = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-    
-    # ==========================================
-    # ডাটা এক্সট্রাকশন (আসল পিক্সেল স্ক্যানিং)
-    # ==========================================
-    rx1, ry1, rx2, ry2 = ROI_ROLL
-    roll_block = thresh_final[ry1:ry2, rx1:rx2]
-    roll_number = ""
-    
-    if roll_block.shape[0] > 0 and roll_block.shape[1] > 0:
-        r_height = roll_block.shape[0] / 10.0
-        r_width = roll_block.shape[1] / 4.0
-        
-        for col in range(4):
-            col_pixels = []
-            for row in range(10):
-                y1 = int(row * r_height)
-                y2 = int((row + 1) * r_height)
-                x1 = int(col * r_width)
-                x2 = int((col + 1) * r_width)
-                
-                bubble = roll_block[y1:y2, x1:x2]
-                
-                # রোল নম্বরের জন্যও বর্ডার বাদ দেওয়া
-                bh, bw = bubble.shape
-                if bh > 4 and bw > 4:
-                    ph, pw = int(bh * 0.25), int(bw * 0.25)
-                    inner_b = bubble[ph:bh-ph, pw:bw-pw]
-                else:
-                    inner_b = bubble
-                    
-                col_pixels.append(cv2.countNonZero(inner_b))
-            
-            max_p = max(col_pixels)
-            min_p = min(col_pixels)
-            
-            if max_p > 20 and (max_p - min_p) > 15:
-                roll_number += str(col_pixels.index(max_p))
-            else:
-                roll_number += "?"
+    # Step 2: উত্তর স্ক্যান
+    answers = scan_answers(warped)
 
-    scanned_answers = {}
-    scanned_answers.update(get_real_answers(thresh_final, ROI_Q_COL1, 1, 23))
-    scanned_answers.update(get_real_answers(thresh_final, ROI_Q_COL2, 24, 35))
-    scanned_answers.update(get_real_answers(thresh_final, ROI_Q_COL3, 59, 35))
-    scanned_answers.update(get_real_answers(thresh_final, ROI_Q_COL4, 94, 7))
+    # Step 3: Summary
+    answered = sum(1 for v in answers.values() if v != "skipped")
+    skipped  = 100 - answered
 
-    return {
-        "success": True,
-        "student_info": {
-            "roll": roll_number
+    result = {
+        "success":  True,
+        "summary":  {
+            "total":    100,
+            "answered": answered,
+            "skipped":  skipped,
         },
-        "answers": scanned_answers
+        "answers":  answers,
     }
+    if warn:
+        result["warning"] = warn
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Flask Routes
+# ══════════════════════════════════════════════════════════════════
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Perfect OMR Scanner Engine is Live!"
+    return jsonify({
+        "status":    "✅ Academic Recap OMR Engine v3",
+        "endpoints": {
+            "POST /scan":        "multipart/form-data, field='image'",
+            "POST /scan/base64": "JSON body: {\"image\": \"<base64>\"}",
+            "GET  /health":      "health check",
+        }
+    })
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
+
 
 @app.route('/scan', methods=['POST'])
-def scan_endpoint():
+def scan_file():
     if 'image' not in request.files:
-        return jsonify({"success": False, "error": "কোনো ছবি আপলোড করা হয়নি!"}), 400
-        
+        return jsonify({"success": False, "error": "No 'image' field"}), 400
     file = request.files['image']
-    image_bytes = file.read()
-    
+    if not file.filename:
+        return jsonify({"success": False, "error": "Empty file"}), 400
     try:
-        result = process_final_omr(image_bytes)
-        return jsonify(result)
+        return jsonify(process_omr(file.read()))
     except Exception as e:
-        return jsonify({"success": False, "error": f"সার্ভার এরর: {str(e)}"}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/scan/base64', methods=['POST'])
+def scan_base64():
+    import base64
+    data = request.get_json(silent=True)
+    if not data or 'image' not in data:
+        return jsonify({"success": False, "error": "JSON must have 'image' (base64 string)"}), 400
+    try:
+        image_bytes = base64.b64decode(data['image'])
+        return jsonify(process_omr(image_bytes))
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=False)
