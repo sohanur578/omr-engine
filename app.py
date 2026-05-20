@@ -8,26 +8,6 @@ ANSWER_CHOICES = {0: "A", 1: "B", 2: "C", 3: "D"}
 
 # ══════════════════════════════════════════════════════════════════
 #  CALIBRATION  (actual image analysis থেকে নেওয়া — পরিবর্তন করবেন না)
-#
-#  OMR image এর ৪ কোণার কালো মার্কার (7mm square):
-#    TL marker center ≈ (8+3.5, 8+3.5)     = 11.5mm from page edge
-#    TR marker center ≈ (195+3.5, 11.5mm)
-#    BL marker center ≈ (11.5mm, 282+3.5)
-#    BR marker center ≈ (198.5mm, 285.5mm)
-#
-#  Marker center-to-center span:
-#    X: 187mm   Y: 274mm
-#
-#  PHP layout (mm):
-#    colX         = [18, 61.5, 105, 148.5]
-#    bubble X     = colX + qNumW(7.5) + 1.5 + idx*8.0 + 2.5
-#    qStartY      = startY(25) + headerH(6) + 2 = 33mm
-#    bubble Y     = 33 + (row)*9.5 + 4.75   (row 0-indexed)
-#    bubble radius = 2.8mm
-#
-#  Warped canvas: 1133 x 1661 px  (marker center to center)
-#  px/mm = 6.0588
-#  Origin offset: 11.5mm (TL marker center from page edge)
 # ══════════════════════════════════════════════════════════════════
 
 WARP_W    = 1133
@@ -54,25 +34,29 @@ for row in range(25):
     ROW_Y.append(int((cy_mm - ORIG_MM) * PX_MM))
 
 # ══════════════════════════════════════════════════════════════════
-#  THRESHOLD টিউনিং
-#  Blank sheet এ বাবলের inner score ≈ 60-90 (শুধু অক্ষরের কালি)
-#  ভরা বাবলে ≈ 150-250 (পুরো ভেতর কালো)
-#  FILL_THRESHOLD: এর চেয়ে বেশি হলেই ভরা ধরা হবে
-#  DIFF_THRESHOLD: সর্বোচ্চ ও সর্বনিম্নের পার্থক্য এর চেয়ে বেশি হলে উত্তর আছে
+#  THRESHOLD টিউনিং (আপডেটেড)
+#  Adaptive threshold ব্যবহারের কারণে স্কোরের মান সামান্য পরিবর্তন করা হয়েছে।
 # ══════════════════════════════════════════════════════════════════
-FILL_THRESHOLD = 130   # blank ≈ 65-90, filled ≈ 150+
-DIFF_THRESHOLD = 50    # blank diff ≈ 10-25, filled diff ≈ 80+
+FILL_THRESHOLD = 120   # blank ≈ 30-80, filled ≈ 150-400
+DIFF_THRESHOLD = 40    # blank diff ≈ 10-30, filled diff ≈ 80+
 INNER_PAD_RATIO = 0.25 # বাবলের ভেতরের কতটুকু দেখব (চারপাশের অক্ষর/border বাদ)
 
 
 def find_markers(gray):
-    """৪টি কালো স্কয়ার মার্কার খুঁজে তাদের center return করা।"""
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh  = cv2.adaptiveThreshold(
+    """৪টি কালো স্কয়ার মার্কার খুঁজে বের করা (বাঁকা ও ছায়াযুক্ত ছবির জন্য অপ্টিমাইজড)।"""
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    
+    # Adaptive threshold - ছায়া এবং কম আলোতে ভালো কাজ করে
+    thresh = cv2.adaptiveThreshold(
         blurred, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 15, 4
+        cv2.THRESH_BINARY_INV, 51, 10
     )
+    
+    # মার্কারের ভেতরের সাদা নয়েজ ফিল করতে dilate করা হচ্ছে
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thresh = cv2.dilate(thresh, kernel, iterations=1)
+
     cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     markers = []
@@ -80,10 +64,20 @@ def find_markers(gray):
         peri   = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.04 * peri, True)
         area   = cv2.contourArea(c)
-        if len(approx) == 4 and 150 < area < 10000:
+        
+        # Area range বাড়ানো হয়েছে যাতে জুম করা বা দূরের ছবিও কাজ করে
+        if 150 < area < 25000:
             x, y, w, h = cv2.boundingRect(c)
             aspect = w / float(h)
-            if 0.7 < aspect < 1.3:  # square-ish
+            
+            # Convex Hull দিয়ে solidity চেক করা হচ্ছে (বক্সটি কতটা ভরাট)
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0: continue
+            solidity = area / float(hull_area)
+            
+            # Aspect ratio ফ্লেক্সিবল করা হয়েছে (0.5 - 2.0) যাতে ছবি বাঁকা হলেও কাজ করে
+            if len(approx) >= 4 and 0.5 < aspect < 2.0 and solidity > 0.8:
                 cx_m = x + w // 2
                 cy_m = y + h // 2
                 markers.append((cx_m, cy_m, area))
@@ -91,11 +85,11 @@ def find_markers(gray):
     if len(markers) < 4:
         return None, f"মাত্র {len(markers)}টি মার্কার পাওয়া গেছে, দরকার ৪টি"
 
-    # সবচেয়ে বড় ৪টি নেওয়া (noise বাদ)
+    # সবচেয়ে বড় ৪টি এরিয়া নেওয়া (ব্যাকগ্রাউন্ড নয়েজ বাদ দিতে)
     markers.sort(key=lambda m: m[2], reverse=True)
     centers = np.array([(m[0], m[1]) for m in markers[:4]], dtype="float32")
 
-    # TL, TR, BR, BL সাজানো
+    # TL, TR, BR, BL সাজানো (Perspective warp এর জন্য অত্যন্ত জরুরি)
     s    = centers.sum(axis=1)
     diff = np.diff(centers, axis=1)
     tl   = centers[np.argmin(s)]
@@ -131,9 +125,13 @@ def bubble_score(thresh_img, cy, cx):
 
 def scan_answers(warped_gray):
     """Warped grayscale থেকে ১০০টি উত্তর বের করা।"""
-    _, thresh = cv2.threshold(
-        warped_gray, 0, 255,
-        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    # গ্লোবাল Otsu এর বদলে Adaptive Thresholding (ছায়া/আলোর সমস্যার জন্য)
+    blurred_warped = cv2.GaussianBlur(warped_gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blurred_warped, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blockSize=45, C=12
     )
 
     answers = {}
@@ -207,7 +205,7 @@ def process_omr(image_bytes):
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "status":    "✅ Academic Recap OMR Engine v3",
+        "status":    "✅ Academic Recap OMR Engine v3 (Pro Vision)",
         "endpoints": {
             "POST /scan":        "multipart/form-data, field='image'",
             "POST /scan/base64": "JSON body: {\"image\": \"<base64>\"}",
@@ -215,11 +213,9 @@ def home():
         }
     })
 
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"})
-
 
 @app.route('/scan', methods=['POST'])
 def scan_file():
@@ -232,7 +228,6 @@ def scan_file():
         return jsonify(process_omr(file.read()))
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route('/scan/base64', methods=['POST'])
 def scan_base64():
